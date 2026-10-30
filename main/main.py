@@ -116,3 +116,4 @@ def help_page():
             ).props('outline').classes('w-48 h-12')
 
 ui.run(title='BluSend', favicon='assets/logo.jpeg', host='127.0.0.1')
+...

@@ -222,8 +222,7 @@ def pin_page():
                     try:
                         delivery_id, delivery_record = await current_delivery()
 
-                        # Real API call: PUT /mail/verify/{delivery_id}
-                        # with {"value": "<entered code>"}.
+
                         result = await verify_delivery(delivery_id, state['pin'])
                         verified, unlocked, returned_compartment = interpret_verification(result)
                         compartment = returned_compartment or extract_compartment(delivery_record)

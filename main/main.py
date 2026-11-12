@@ -6,7 +6,9 @@ from staff_portal.api_client import APIError, verify_delivery
 
 # Robot config
 
-ASSETS = Path(__file__).resolve().parent / 'assets'
+from pathlib import Path
+
+ASSETS = Path(__file__).resolve().parent.parent / 'assets'
 app.add_static_files('/assets', str(ASSETS))
 
 # Testing: enter the delivery reference before the PIN.

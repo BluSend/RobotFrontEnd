@@ -1,140 +1,415 @@
-"""BluSend robot touchscreen connected to the existing team backend.
 
-The emailed collection PIN is checked by the actual verification endpoint.
-Recipients enter one code only. We do not fake success or compartment unlocks.
-"""
-
-import os
 from pathlib import Path
 
 from nicegui import app, ui
 from staff_portal.api_client import APIError, get_due_parcels, verify_delivery
 
 
-# Robot configuration
+# Project settings
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 ASSETS = PROJECT_DIR / 'assets'
 LOGO = ASSETS / 'logo.jpeg'
 
-# Prevent a startup crash when the assets directory has not been created yet.
 if ASSETS.is_dir():
     app.add_static_files('/assets', str(ASSETS))
 
-# Optional: robot's job-assigned delivery ID can be provided by its controller.
-# The recipient never enters or sees this ID. If it is not set, this UI
-# checks GET /mail/list/ and only auto-selects a delivery if exactly one is due.
-ACTIVE_DELIVERY_ID = os.getenv('BLUSEND_DELIVERY_ID', '').strip() or None
+MIN_CODE_LENGTH = 4
+MAX_CODE_LENGTH = 8
 
 
-class DeliveryAssignmentError(Exception):
-    """The robot cannot unambiguously identify the delivery to verify."""
+class NoDueParcelsError(Exception):
+    pass
 
 
-def get_record_delivery_id(record):
-    """Extract an ID from a /mail/list/ item, if exposed by the backend."""
-    for key in ('delivery_id', 'deliveryID', 'deliveryId', 'id', 'ID'):
-        value = record.get(key)
-        if value is not None and str(value).strip():
-            return str(value)
-    return None
+# Due parcels
+async def get_due_tracking_ids():
+    parcels = await get_due_parcels()
+    tracking_ids = []
 
+    for parcel in parcels:
+        if not isinstance(parcel, dict):
+            continue
 
-async def current_delivery():
-    """Return (delivery ID, delivery record); never guess among several jobs."""
-    if ACTIVE_DELIVERY_ID:
-        return ACTIVE_DELIVERY_ID, {}
+        if str(parcel.get('status', 'Due')).strip().lower() != 'due':
+            continue
 
-    due = await get_due_parcels()
-    if len(due) == 0:
-        raise DeliveryAssignmentError('No delivery is currently waiting for collection.')
-    if len(due) > 1:
-        raise DeliveryAssignmentError(
-            'Several deliveries are pending. The robot needs its assigned '
-            'delivery ID from the backend before a code can be checked.'
+        for field in ('tracking_id', 'trackingID', 'trackingId'):
+            value = parcel.get(field)
+
+            if value is not None and str(value).strip():
+                tracking_id = str(value).strip()
+
+                if tracking_id not in tracking_ids:
+                    tracking_ids.append(tracking_id)
+                break
+
+    if not tracking_ids:
+        raise NoDueParcelsError(
+            'There are no Due parcels available for verification.'
         )
 
-    record = due[0]
-    delivery_id = get_record_delivery_id(record)
-    if delivery_id is None:
-        raise DeliveryAssignmentError(
-            'The pending delivery has no recognised delivery ID. '
-            'Check the fields returned by GET /mail/list/.'
-        )
-    return delivery_id, record
+    return tracking_ids
 
 
-def extract_compartment(record):
-    """Only use a field expressly labelled as a compartment or slot."""
-    if not isinstance(record, dict):
+# Backend responses
+def read_status(value):
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
         return None
-    for key in ('compartment_id', 'compartmentID', 'compartment',
-                'compartment_number', 'compartmentNumber', 'slot'):
-        value = record.get(key)
-        if value is not None and str(value).strip():
-            return str(value)
+
+    message = str(value).strip().lower()
+
+    if message in ('true', 'false'):
+        return message == 'true'
+
+    failed_words = (
+        'invalid', 'incorrect', 'expired', 'failed', 'failure', 'fail',
+        'unsuccessful', 'not successful', 'rejected', 'wrong',
+        'unauthorised', 'unauthorized', 'not verified', 'not valid',
+        'not found', 'not accepted', 'denied', 'error', 'unable to'
+    )
+
+    success_words = (
+        'verified', 'valid', 'correct', 'success',
+        'accepted', 'authenticated'
+    )
+
+    if any(word in message for word in failed_words):
+        return False
+
+    if any(word in message for word in success_words):
+        return True
+
     return None
 
-MIN_PIN_LENGTH = 4
-MAX_PIN_LENGTH = 8
+
+def check_response(response):
+    if isinstance(response, dict):
+
+        for key in ('verified', 'valid', 'authenticated', 'success'):
+            value = response.get(key)
+
+            if isinstance(value, bool):
+                return value
+
+        for key in ('status', 'message', 'detail', 'result'):
+            result = read_status(response.get(key))
+
+            if result is not None:
+                return result
+
+        return None
+
+    return read_status(response)
 
 
-# Main screen design
+def incorrect_code_error(error):
+    message = str(error).lower()
+
+    client_error = any(
+        f'http {code}' in message
+        for code in (400, 401, 403)
+    )
+
+    return client_error and read_status(message) is False
+
+
+def connection_error_message(error):
+    message = str(error).lower()
+
+    if 'backend address' in message or 'blusend_api_url' in message:
+        return 'Connection settings are missing. Please contact staff.'
+
+    if any(f'http {code}' in message for code in (400, 401, 403, 404, 422)):
+        return 'Your request could not be completed. Please contact staff.'
+
+    return 'Connection unavailable. Please try again.'
+
+
+# Code verification
+async def verify_collection_code(code):
+    tracking_ids = await get_due_tracking_ids()
+    unknown_result = False
+
+    for tracking_id in tracking_ids:
+        try:
+            response = await verify_delivery(str(tracking_id), code)
+            result = check_response(response)
+
+        except APIError as error:
+            if incorrect_code_error(error):
+                continue
+
+            unknown_result = True
+            continue
+
+        if result is True:
+            return True
+
+        if result is None:
+            unknown_result = True
+
+    if unknown_result:
+        return None
+
+    return False
+
+
+# Touchscreen styling
+STYLE = '''
+<style>
+html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    background: white;
+    overflow: hidden;
+}
+
+.nicegui-content {
+    width: 100%;
+    height: 100dvh;
+    padding: 0 !important;
+}
+
+.screen {
+    width: 100%;
+    height: 100dvh;
+    box-sizing: border-box;
+    padding: 20px;
+    gap: 12px;
+    background: white;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.header {
+    width: 100%;
+    min-height: 100px;
+    flex-shrink: 0;
+}
+
+.logo {
+    width: 230px;
+    height: 100px;
+}
+
+.title {
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.instructions {
+    font-size: 17px;
+    line-height: 1.4;
+}
+
+.pin {
+    font-size: 36px;
+    color: #2563eb;
+    letter-spacing: 5px;
+    min-height: 44px;
+}
+
+.message {
+    font-size: 16px;
+    min-height: 44px;
+    max-height: 90px;
+    overflow-y: auto;
+}
+
+.home {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+}
+
+.home .q-btn {
+    width: 270px;
+    min-height: 54px;
+    font-size: 17px;
+}
+
+.code-layout {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    max-width: 1060px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+}
+
+.code-details {
+    flex: 1;
+    min-width: 0;
+    max-width: 560px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 14px;
+}
+
+.keypad {
+    display: grid;
+    grid-template-columns: repeat(3, 100px);
+    gap: 10px;
+    flex-shrink: 0;
+}
+
+.keypad .q-btn {
+    height: 68px;
+    min-height: 68px;
+    font-size: 23px;
+}
+
+.help {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.help-content {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.help-line {
+    font-size: 16px;
+    line-height: 1.5;
+}
+
+@media (max-width: 950px), (max-height: 550px) {
+    .screen {
+        padding: 10px;
+        gap: 6px;
+    }
+
+    .header {
+        min-height: 62px;
+    }
+
+    .logo {
+        width: 160px;
+        height: 62px;
+    }
+
+    .title {
+        font-size: 21px;
+    }
+
+    .instructions, .message, .help-line {
+        font-size: 13px;
+    }
+
+    .pin {
+        font-size: 28px;
+        min-height: 32px;
+    }
+
+    .message {
+        min-height: 30px;
+        max-height: 55px;
+    }
+
+    .home {
+        gap: 10px;
+    }
+
+    .home .q-btn {
+        width: 240px;
+        min-height: 44px;
+        font-size: 15px;
+    }
+
+    .code-layout {
+        max-width: 800px;
+        gap: 18px;
+    }
+
+    .code-details {
+        gap: 7px;
+    }
+
+    .keypad {
+        grid-template-columns: repeat(3, 78px);
+        gap: 6px;
+    }
+
+    .keypad .q-btn {
+        height: 48px;
+        min-height: 48px;
+        font-size: 19px;
+    }
+
+    .help-content {
+        max-width: 620px;
+        gap: 8px;
+    }
+}
+
+@media (max-width: 620px) {
+    html, body {
+        overflow-y: auto;
+    }
+
+    .screen {
+        height: auto;
+        min-height: 100dvh;
+        overflow: visible;
+    }
+
+    .code-layout {
+        flex-direction: column;
+        justify-content: center;
+    }
+
+    .code-details {
+        width: 100%;
+        align-items: center;
+        text-align: center;
+    }
+}
+</style>
+'''
+
+
+# Screen layout
 def base_screen():
+    ui.add_head_html(STYLE)
     ui.colors(primary='#2563EB')
-    ui.query('body').style('margin: 0; background: #EAF2FF;')
-    ui.query('.nicegui-content').classes('w-full p-0')
 
-    with ui.element('div').classes(
-        'w-full flex items-center justify-center p-2'
-    ).style('min-height: 100dvh;'):
-        return ui.card().classes(
-            'w-full flex flex-col rounded-2xl shadow-lg p-4 gap-3'
-        ).style('max-width: 800px; min-height: 450px;')
+    return ui.column().classes('screen')
 
 
-# Main header
 def screen_header():
-    with ui.row().classes('w-full items-center justify-between'):
+    with ui.row().classes('header items-center justify-between no-wrap'):
+
         if LOGO.is_file():
-            ui.image('/assets/logo.jpeg').classes('w-28 h-12').props('fit-contain')
+            ui.image('/assets/logo.jpeg').classes('logo').props('fit=contain')
         else:
-            ui.label('BluSend').classes('text-xl font-bold text-blue-700')
+            ui.label('BluSend').classes('text-xl font-bold text-blue-600')
 
         ui.label('MAIL DELIVERY ROBOT').classes('text-xs text-gray-500')
 
     ui.separator()
-
-
-# Interpret backend verification response
-def interpret_verification(result):
-    """Return (verified, unlocked, compartment) without assuming an unlock.
-
-    verified is True, False or None (unknown response format).
-    """
-    if isinstance(result, bool):
-        return result, False, None
-
-    if isinstance(result, str):
-        value = result.strip().lower()
-        if value in ('true', 'verified', 'success'):
-            return True, False, None
-        if value in ('false', 'invalid', 'incorrect'):
-            return False, False, None
-
-    if isinstance(result, dict):
-        verified = next(
-            (
-                result[key]
-                for key in ('verified', 'valid', 'authenticated', 'success')
-                if type(result.get(key)) is bool
-            ),
-            None,
-        )
-        unlocked = result.get('unlocked') is True
-        compartment = extract_compartment(result)
-        return verified, unlocked, compartment
-
-    return None, False, None
 
 
 # Home page
@@ -143,153 +418,141 @@ def home_page():
     with base_screen():
         screen_header()
 
-        with ui.column().classes(
-            'w-full flex-1 items-center justify-center gap-4'
-        ):
-            ui.label('Welcome to BluSend').classes(
-                'text-3xl font-bold text-gray-900'
-            )
-            ui.label('How can we help you today?').classes('text-gray-500')
+        with ui.element('div').classes('home'):
+            ui.label('Welcome to BluSend').classes('title text-gray-900')
+
+            ui.label(
+                'Your collection code has been sent to your email.'
+            ).classes('instructions text-gray-500')
 
             ui.button(
                 'Collect Mail',
                 icon='mail',
-                on_click=lambda: ui.navigate.to('/pin_entry'),
-            ).classes('w-64 h-14 text-lg')
+                on_click=lambda: ui.navigate.to('/pin_entry')
+            ).props('no-caps')
 
             ui.button(
                 'Help',
                 icon='help_outline',
-                on_click=lambda: ui.navigate.to('/help'),
-            ).classes('w-64 h-12').props('outline')
+                on_click=lambda: ui.navigate.to('/help')
+            ).props('outline no-caps')
 
 
-# One-code collection screen
+# Code entry page
 @ui.page('/pin_entry')
 def pin_page():
-    state = {'pin': '', 'busy': False}
+    state = {'code': '', 'busy': False}
 
     with base_screen():
         screen_header()
 
-        with ui.row().classes(
-            'w-full flex-1 items-start justify-between gap-4 flex-nowrap'
-        ):
-            with ui.column().classes('flex-1 gap-3'):
-                ui.icon('lock_outline', size='38px', color='primary')
+        with ui.element('div').classes('code-layout'):
+            with ui.element('div').classes('code-details'):
 
-                ui.label('Enter your collection PIN').classes(
-                    'text-xl font-bold text-gray-900'
-                )
-                ui.label('Use the keypad to enter the PIN sent to your email.').classes(
-                    'text-sm text-gray-500'
-                )
+                ui.icon('lock_outline', size='31px', color='primary')
 
-                digits = ui.label('—').classes(
-                    'text-3xl font-mono tracking-widest text-blue-700'
-                )
-                status = ui.label('').classes('text-sm text-gray-700')
+                ui.label(
+                    'Enter your collection code'
+                ).classes('title text-gray-900')
 
-                def refresh_display():
-                    digits.set_text('●' * len(state['pin']) or '—')
+                ui.label(
+                    'Use the keypad to enter the code from your email.'
+                ).classes('instructions text-gray-500')
+
+                digits = ui.label('—').classes('pin')
+
+                status = ui.label(
+                    'Check your email for the collection code.'
+                ).classes('message text-gray-700')
+
+                # Keypad input
+                def update_display():
+                    digits.set_text('●' * len(state['code']) or '—')
 
                 def press_key(key):
                     if state['busy']:
                         return
 
                     if key == 'Clear':
-                        state['pin'] = ''
+                        state['code'] = ''
+
                     elif key == '⌫':
-                        state['pin'] = state['pin'][:-1]
-                    elif len(state['pin']) < MAX_PIN_LENGTH:
-                        state['pin'] += key
+                        state['code'] = state['code'][:-1]
+
+                    elif len(state['code']) < MAX_CODE_LENGTH:
+                        state['code'] += key
 
                     status.set_text('')
-                    refresh_display()
+                    update_display()
 
-                async def submit():
+                # Verify code
+                async def verify_code():
                     if state['busy']:
                         return
 
-                    if not MIN_PIN_LENGTH <= len(state['pin']) <= MAX_PIN_LENGTH:
-                        status.set_text('Enter the complete PIN from your email.')
+                    if not MIN_CODE_LENGTH <= len(state['code']) <= MAX_CODE_LENGTH:
+                        status.set_text(
+                            'Please enter the complete code from your email.'
+                        )
                         return
 
                     state['busy'] = True
-                    action.disable()
-                    status.set_text('Checking your code with the backend...')
+                    verify_button.disable()
+                    status.set_text('Checking your code...')
 
                     try:
-                        delivery_id, delivery_record = await current_delivery()
+                        result = await verify_collection_code(state['code'])
 
+                        if result is True:
+                            status.set_text(
+                                'Authentication Successful! Your code is correct.'
+                            )
 
-                        result = await verify_delivery(delivery_id, state['pin'])
-                        verified, unlocked, returned_compartment = interpret_verification(result)
-                        compartment = returned_compartment or extract_compartment(delivery_record)
+                        elif result is False:
+                            status.set_text(
+                                'Authentication Failed. Incorrect or expired code.'
+                            )
 
-                        if verified is False:
-                            status.set_text('Incorrect or expired code. Please try again.')
-                        elif verified is None:
-                            status.set_text(
-                                'Backend replied, but did not explicitly confirm '
-                                'whether this code is correct. Check the API response.'
-                            )
-                        elif compartment is not None and unlocked:
-                            status.set_text(
-                                f'Code correct! Compartment {compartment} is unlocked. '
-                                'Please collect your parcel.'
-                            )
-                        elif compartment is not None:
-                            status.set_text(
-                                f'Code correct! Collect your parcel from '
-                                f'Compartment {compartment} once it opens.'
-                            )
                         else:
                             status.set_text(
-                                'Code correct! The backend did not provide a '
-                                'compartment number. Please contact mailroom staff.'
+                                'Unable to verify your code. '
+                                'Please try again or contact staff.'
                             )
-                    except DeliveryAssignmentError as error:
+
+                    except NoDueParcelsError as error:
                         status.set_text(str(error))
-                    except APIError as error:
-                        detail = str(error)
-                        if any(f'HTTP {status_code}' in detail for status_code in (400, 401, 403)):
-                            status.set_text('Code not accepted. Please check and try again.')
-                        else:
-                            status.set_text(
-                                'Cannot verify with the backend right now. '
-                                'Please contact mailroom staff.'
-                            )
-                    finally:
-                        state['pin'] = ''
-                        refresh_display()
-                        state['busy'] = False
-                        action.enable()
 
-                action = ui.button(
-                    'Verify PIN', on_click=submit
-                ).classes('w-52 h-11')
+                    except APIError as error:
+                        status.set_text(connection_error_message(error))
+
+                    finally:
+                        state['code'] = ''
+                        update_display()
+                        state['busy'] = False
+                        verify_button.enable()
+
+                verify_button = ui.button(
+                    'Verify Code',
+                    on_click=verify_code
+                ).props('no-caps')
 
                 ui.button(
                     'Back to Home',
                     icon='arrow_back',
-                    on_click=lambda: ui.navigate.to('/'),
-                ).props('flat no-caps')
+                    on_click=lambda: ui.navigate.to('/')
+                ).props('flat no-caps dense')
 
-            # On-screen numeric keypad
-            with ui.grid(columns=3).classes('gap-2'):
+            with ui.element('div').classes('keypad'):
                 for key in (
                     '1', '2', '3',
                     '4', '5', '6',
                     '7', '8', '9',
-                    'Clear', '0', '⌫',
+                    'Clear', '0', '⌫'
                 ):
                     ui.button(
                         key,
-                        on_click=lambda value=key: press_key(value),
-                    ).props('no-caps').style(
-                        'width: 75px; height: 54px; font-size: 19px;'
-                    )
+                        on_click=lambda value=key: press_key(value)
+                    ).props('no-caps')
 
 
 # Help page
@@ -298,32 +561,41 @@ def help_page():
     with base_screen():
         screen_header()
 
-        with ui.column().classes('w-full flex-1 justify-center gap-3'):
-            ui.label('How can we help?').classes('text-2xl font-bold')
-            ui.label('1. Select Collect Mail on the home screen.')
-            ui.label('2. Enter the collection PIN sent to your email.')
-            ui.label('3. Collect your mail only when the compartment opens.')
+        with ui.element('div').classes('help'):
+            with ui.element('div').classes('help-content'):
 
-            ui.separator()
-            ui.label(
-                'If your PIN is rejected or the compartment does not '
-                'open, contact mailroom staff.'
-            ).classes('text-gray-600')
+                ui.label('How can we help?').classes('title text-gray-900')
 
-            ui.button(
-                'Back to Home',
-                icon='arrow_back',
-                on_click=lambda: ui.navigate.to('/'),
-            ).props('outline no-caps').classes('w-48 h-11')
+                steps = (
+                    '1. Staff mark your parcel Due and send a code to your email.',
+                    '2. Check your inbox and enter the emailed code.',
+                    '3. Press Verify Code to check your code.',
+                    '4. The screen shows Authentication Successful or Failed.'
+                )
+
+                for step in steps:
+                    ui.label(step).classes('help-line text-gray-900')
+
+                ui.label(
+                    'If your code is rejected, contact mailroom staff.'
+                ).classes('text-sm text-gray-600')
+
+                ui.button(
+                    'Back to Home',
+                    icon='arrow_back',
+                    on_click=lambda: ui.navigate.to('/')
+                ).props('outline no-caps')
 
 
-# Run the robot interface
+# Run application
 if __name__ in ('__main__', '__mp_main__'):
     settings = {
         'title': 'BluSend',
         'host': '127.0.0.1',
-        'port': 8080,
+        'port': 8080
     }
+
     if LOGO.is_file():
         settings['favicon'] = str(LOGO)
+
     ui.run(**settings)

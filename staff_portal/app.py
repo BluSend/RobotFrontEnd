@@ -1,20 +1,18 @@
 from nicegui import ui
 
-from staff_portal.config import (
-    APP_TITLE,
-    APP_PORT
-)
+from staff_portal.config import APP_TITLE, APP_PORT
 
-# Register Website Pages
+
+# Website pages
 from staff_portal.pages import (
     dashboard,
     recipients,
     parcels
 )
 
-# Start Website
-if __name__ in ('__main__', '__mp_main__'):
 
+# Run website
+if __name__ in ('__main__', '__mp_main__'):
     ui.run(
         title=APP_TITLE,
         port=APP_PORT,

@@ -1,7 +1,5 @@
 from nicegui import ui
 
-from staff_portal.layout import page_layout
-
 from staff_portal.api_client import (
     APIError,
     get_users,
@@ -9,148 +7,140 @@ from staff_portal.api_client import (
     add_parcel,
     update_parcel,
     remove_parcel,
-    get_due_parcels
+    get_due_parcels,
+    generate_delivery_otp
 )
 
-# -------------------- PARCEL MANAGEMENT --------------------
+from staff_portal.layout import page_layout
 
+
+# OTP response
+def otp_rejected(result):
+    if result is False:
+        return True
+
+    if isinstance(result, str):
+        return any(
+            word in result.lower()
+            for word in ('failed', 'failure', 'error', 'invalid', 'not found')
+        )
+
+    if isinstance(result, dict):
+        if result.get('success') is False or result.get('sent') is False:
+            return True
+
+        return any(
+            word in str(result.get(field, '')).lower()
+            for field in ('status', 'message', 'detail')
+            for word in ('failed', 'failure', 'error', 'invalid', 'not found')
+        )
+
+    return False
+
+
+# Parcel management
 @ui.page('/parcels')
 async def parcels_page():
 
     with page_layout('Parcel Management', '/parcels'):
 
         ui.label(
-            'Register and manage parcel records stored on the backend.'
+            'Add, update and manage parcels.'
         ).classes('text-slate-500')
 
+        # Add parcel
+        with ui.card().classes('w-full p-5 gap-3'):
 
-        # -------------------- ADD PARCEL --------------------
-
-
-        with ui.card().classes('w-full p-5 gap-4'):
-
-            ui.label('Register New Parcel').classes(
+            ui.label('Add Parcel').classes(
                 'text-xl font-semibold'
             )
 
-            ui.label(
-                'Select the recipient for the incoming parcel.'
-            ).classes('text-slate-500')
-
-            # Retrieve registered users from the backend
             try:
                 users = await get_users()
-
             except APIError as error:
                 users = []
-                ui.label(
-                    f'Unable to load recipients: {error}'
-                ).classes('text-red-700')
-
-            # Create recipient dropdown options
-            recipient_options = {}
-
-            for user in users:
-
-                user_id = user.get('userID', user.get('id'))
-
-                if user_id is None:
-                    continue
-
-                recipient_options[int(user_id)] = (
-                    f"{user.get('name', 'Unknown')} — "
-                    f"{user.get('roomNumber', 'No room')}"
+                ui.notify(
+                    f'Unable to load recipients: {error}',
+                    type='negative'
                 )
 
-            if recipient_options:
+            recipients = {}
 
-                recipient_input = ui.select(
-                    recipient_options,
-                    label='Select Recipient'
-                ).props('outlined').classes('w-full')
+            for user in users:
+                user_id = user.get('userID', user.get('id'))
 
-                # -------------------- REGISTER PARCEL --------------------
-
-                async def create_parcel():
-
-                    if recipient_input.value is None:
-                        ui.notify(
-                            'Select a recipient first.',
-                            type='warning'
-                        )
-                        return
-
-                    try:
-                        await add_parcel(
-                            recipient_input.value
-                        )
-
-                    except APIError as error:
-                        ui.notify(str(error), type='negative')
-                        return
-
-                    ui.notify(
-                        'Parcel registered successfully.',
-                        type='positive'
+                if user_id is not None:
+                    recipients[int(user_id)] = (
+                        f"{user.get('name', 'Unknown')} "
+                        f"({user.get('email', '')})"
                     )
 
-                    ui.navigate.reload()
+            selected_recipient = ui.select(
+                options=recipients,
+                label='Select Recipient'
+            ).props('outlined').classes('w-full')
 
-                ui.button(
-                    'Register Parcel',
-                    icon='add_box',
-                    on_click=create_parcel
-                ).props('no-caps')
+            async def create_parcel():
 
-            else:
+                if selected_recipient.value is None:
+                    ui.notify(
+                        'Please select a recipient.',
+                        type='warning'
+                    )
+                    return
 
-                ui.label(
-                    'No recipients are available for selection.'
-                ).classes('text-slate-500')
+                try:
+                    await add_parcel(
+                        int(selected_recipient.value)
+                    )
 
-                ui.button(
-                    'Open Recipient Directory',
-                    icon='people',
-                    on_click=lambda: ui.navigate.to('/recipients')
-                ).props('no-caps')
+                except APIError as error:
+                    ui.notify(str(error), type='negative')
+                    return
 
-        # -------------------- RETRIEVE PARCELS --------------------
+                ui.notify(
+                    'Parcel added successfully.',
+                    type='positive'
+                )
 
+                ui.navigate.reload()
+
+            ui.button(
+                'Add Parcel',
+                icon='add_box',
+                on_click=create_parcel
+            ).props('no-caps')
+
+        # Load parcels
         try:
-            parcels = await get_parcels()
+            raw_parcels = await get_parcels()
 
         except APIError as error:
-            parcels = []
-
+            raw_parcels = []
             ui.label(
                 f'Unable to load parcels: {error}'
             ).classes('text-red-700')
 
-
         rows = [
             {
-                'row_id': index,
+                'row_id': idx,
                 'id': parcel.get('id'),
                 'tracking_id': parcel.get('tracking_id'),
                 'userID': parcel.get('userID'),
                 'status': parcel.get('status', ''),
                 'nDelivery': parcel.get('nDelivery')
             }
-            for index, parcel in enumerate(parcels)
+            for idx, parcel in enumerate(raw_parcels)
         ]
 
-
-        # -------------------- PARCEL TABLE --------------------
-
+        # Parcel table
         ui.label('Registered Parcels').classes(
             'text-xl font-semibold mt-4'
         )
 
         search = ui.input(
             'Search Parcels'
-        ).props(
-            'outlined clearable'
-        ).classes('w-80 max-w-full')
+        ).props('outlined clearable').classes('w-80')
 
         columns = [
             {
@@ -161,11 +151,11 @@ async def parcels_page():
                 'align': 'left'
             }
             for key, label in [
-                ('id', 'Parcel ID'),
+                ('id', 'ID'),
                 ('tracking_id', 'Tracking ID'),
                 ('userID', 'User ID'),
                 ('status', 'Status'),
-                ('nDelivery', 'Delivery Count')
+                ('nDelivery', 'Deliveries')
             ]
         ]
 
@@ -179,9 +169,7 @@ async def parcels_page():
 
         search.bind_value(table, 'filter')
 
-
-        # -------------------- SELECT PARCEL --------------------
-
+        # Select parcel
         def selected_parcel():
 
             if not table.selected:
@@ -193,9 +181,7 @@ async def parcels_page():
 
             return table.selected[0]
 
-
-        # -------------------- EDIT PARCEL --------------------
-
+        # Edit parcel
         with ui.dialog() as edit_dialog:
 
             with ui.card().classes('w-96 max-w-full p-5 gap-3'):
@@ -215,58 +201,107 @@ async def parcels_page():
                 ).classes('w-full')
 
                 edit_status = ui.input(
-                    'Parcel Status'
+                    'Status'
                 ).classes('w-full')
 
                 edit_count = ui.number(
-                    'Delivery Count (nDelivery)',
+                    'Number of Deliveries',
                     precision=0
                 ).classes('w-full')
 
+                previous = {
+                    'status': '',
+                    'tracking_id': ''
+                }
 
                 async def save_changes():
 
-                    numeric_fields = (
-                        edit_user_id,
-                        edit_tracking_id,
-                        edit_count
-                    )
-
                     if (
-                        any(field.value is None for field in numeric_fields)
+                        any(
+                            field.value is None
+                            for field in (
+                                edit_user_id,
+                                edit_tracking_id,
+                                edit_count
+                            )
+                        )
                         or not (edit_status.value or '').strip()
                     ):
                         ui.notify(
-                            'Complete all parcel fields.',
+                            'Complete all fields.',
                             type='warning'
                         )
                         return
 
+                    status = edit_status.value.strip()
+                    tracking_id = str(int(edit_tracking_id.value))
+
+                    newly_due = (
+                        status.lower() == 'due'
+                        and (
+                            previous['status'].strip().lower() != 'due'
+                            or previous['tracking_id'] != tracking_id
+                        )
+                    )
+
                     try:
                         await update_parcel(
                             int(edit_user_id.value),
-                            edit_status.value.strip(),
+                            status,
                             int(edit_tracking_id.value),
                             int(edit_count.value)
                         )
 
                     except APIError as error:
-                        ui.notify(str(error), type='negative')
+                        ui.notify(
+                            f'Parcel update failed: {error}',
+                            type='negative'
+                        )
                         return
 
                     edit_dialog.close()
 
-                    ui.notify(
-                        'Parcel update request accepted.',
-                        type='positive'
-                    )
+                    # Email collection code
+                    if newly_due:
+
+                        try:
+                            response = await generate_delivery_otp(
+                                tracking_id
+                            )
+
+                            if otp_rejected(response):
+                                ui.notify(
+                                    'Parcel saved, but the collection code '
+                                    'could not be sent.',
+                                    type='negative',
+                                    timeout=10000
+                                )
+
+                            else:
+                                ui.notify(
+                                    'Parcel set to Due. '
+                                    'Collection code requested by email.',
+                                    type='positive',
+                                    timeout=8000
+                                )
+
+                        except APIError as error:
+                            ui.notify(
+                                f'Parcel saved, but the collection code '
+                                f'could not be sent: {error}',
+                                type='negative',
+                                timeout=10000
+                            )
+
+                    else:
+                        ui.notify(
+                            'Parcel updated.',
+                            type='positive'
+                        )
 
                     ui.navigate.reload()
 
-
-                with ui.row().classes(
-                    'w-full justify-end gap-2'
-                ):
+                with ui.row().classes('justify-end w-full'):
 
                     ui.button(
                         'Cancel',
@@ -275,28 +310,44 @@ async def parcels_page():
 
                     ui.button(
                         'Save Changes',
-                        icon='save',
                         on_click=save_changes
                     ).props('no-caps')
 
-
-        def open_edit_dialog():
+        # Open edit dialog
+        def open_edit():
 
             parcel = selected_parcel()
 
             if parcel is None:
                 return
 
-            edit_user_id.set_value(parcel.get('userID'))
-            edit_tracking_id.set_value(parcel.get('tracking_id'))
-            edit_status.set_value(parcel.get('status', ''))
-            edit_count.set_value(parcel.get('nDelivery'))
+            previous['status'] = str(
+                parcel.get('status') or ''
+            )
+
+            previous['tracking_id'] = str(
+                parcel.get('tracking_id') or ''
+            )
+
+            edit_user_id.set_value(
+                parcel.get('userID')
+            )
+
+            edit_tracking_id.set_value(
+                parcel.get('tracking_id')
+            )
+
+            edit_status.set_value(
+                parcel.get('status', '')
+            )
+
+            edit_count.set_value(
+                parcel.get('nDelivery')
+            )
 
             edit_dialog.open()
 
-
-        # -------------------- REMOVE PARCEL --------------------
-
+        # Remove parcel
         with ui.dialog() as delete_dialog:
 
             with ui.card().classes('w-96 max-w-full p-5 gap-3'):
@@ -306,7 +357,6 @@ async def parcels_page():
                 )
 
                 ui.label(
-                    'Enter the parcel ID to remove. '
                     'This action cannot be undone.'
                 )
 
@@ -315,36 +365,37 @@ async def parcels_page():
                     precision=0
                 ).classes('w-full')
 
-
-                async def confirm_removal():
+                async def confirm_remove():
 
                     if delete_id.value is None:
                         ui.notify(
-                            'Enter a parcel ID.',
+                            'Enter an ID.',
                             type='warning'
                         )
                         return
 
                     try:
-                        await remove_parcel(int(delete_id.value))
+                        await remove_parcel(
+                            int(delete_id.value)
+                        )
 
                     except APIError as error:
-                        ui.notify(str(error), type='negative')
+                        ui.notify(
+                            str(error),
+                            type='negative'
+                        )
                         return
 
                     delete_dialog.close()
 
                     ui.notify(
-                        'Parcel removal request accepted.',
+                        'Parcel removed.',
                         type='positive'
                     )
 
                     ui.navigate.reload()
 
-
-                with ui.row().classes(
-                    'w-full justify-end gap-2'
-                ):
+                with ui.row().classes('justify-end w-full'):
 
                     ui.button(
                         'Cancel',
@@ -354,18 +405,63 @@ async def parcels_page():
                     ui.button(
                         'Confirm Removal',
                         color='negative',
-                        on_click=confirm_removal
+                        on_click=confirm_remove
                     ).props('no-caps')
 
+        # Send collection code
+        async def send_code_to_selected():
 
-        # -------------------- MANAGEMENT BUTTONS --------------------
+            parcel = selected_parcel()
 
+            if parcel is None:
+                return
+
+            if str(parcel.get('status', '')).strip().lower() != 'due':
+                ui.notify(
+                    'Only Due parcels can receive a collection code.',
+                    type='warning'
+                )
+                return
+
+            tracking_id = parcel.get('tracking_id')
+
+            if tracking_id is None or not str(tracking_id).strip():
+                ui.notify(
+                    'The selected parcel has no tracking ID.',
+                    type='negative'
+                )
+                return
+
+            try:
+                result = await generate_delivery_otp(
+                    str(tracking_id)
+                )
+
+                if otp_rejected(result):
+                    ui.notify(
+                        'Could not send the collection code.',
+                        type='negative'
+                    )
+
+                else:
+                    ui.notify(
+                        'Collection code requested by email.',
+                        type='positive'
+                    )
+
+            except APIError as error:
+                ui.notify(
+                    f'Could not send collection code: {error}',
+                    type='negative'
+                )
+
+        # Management buttons
         with ui.row().classes('gap-3'):
 
             ui.button(
                 'Modify Selected Parcel',
                 icon='edit',
-                on_click=open_edit_dialog
+                on_click=open_edit
             ).props('outline no-caps')
 
             ui.button(
@@ -375,55 +471,66 @@ async def parcels_page():
                 on_click=delete_dialog.open
             ).props('outline no-caps')
 
+            ui.button(
+                'Send Collection Code',
+                icon='mail',
+                on_click=send_code_to_selected
+            ).props('outline no-caps')
 
-        # -------------------- PARCELS DUE --------------------
-
+        # Due parcels
         ui.label('Parcels Due').classes(
             'text-xl font-semibold mt-4'
         )
 
         try:
-            due_parcels = await get_due_parcels()
+            due_rows = await get_due_parcels()
 
-            if due_parcels:
+            if due_rows:
 
-                fields = list(due_parcels[0].keys())
+                # Due parcel columns
+                column_labels = {
+                    'roomNumber': 'Room Number',
+                    'status': 'Status',
+                    'tracking_id': 'Tracking ID',
+                    'compartment_number': 'Compartment Number'
+                }
+
+                keys = list(due_rows[0].keys())
 
                 due_columns = [
                     {
-                        'name': field,
-                        'field': field,
-                        'label': field,
+                        'name': key,
+                        'field': key,
+                        'label': column_labels.get(key, key),
                         'align': 'left'
                     }
-                    for field in fields
+                    for key in keys
                 ]
 
-                due_rows = [
+                simple_rows = [
                     {
-                        field: (
-                            str(parcel.get(field))
-                            if isinstance(parcel.get(field), (dict, list))
-                            else parcel.get(field)
+                        key: (
+                            str(row.get(key))
+                            if isinstance(row.get(key), (dict, list))
+                            else row.get(key)
                         )
-                        for field in fields
+                        for key in keys
                     }
-                    for parcel in due_parcels
+                    for row in due_rows
                 ]
 
                 ui.table(
                     columns=due_columns,
-                    rows=due_rows,
+                    rows=simple_rows,
                     pagination=10
-                ).classes('w-full').props('flat bordered')
+                ).classes('w-full')
 
             else:
                 ui.label(
-                    'No parcels are currently due for delivery.'
+                    'No parcels currently due.'
                 ).classes('text-slate-500')
 
         except APIError as error:
-
             ui.label(
-                f'Unable to retrieve parcels due: {error}'
+                f'Unable to load parcels due: {error}'
             ).classes('text-red-700')

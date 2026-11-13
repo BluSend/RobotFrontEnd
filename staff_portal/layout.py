@@ -1,8 +1,7 @@
-
-from nicegui import ui
+from pathlib import Path
+from nicegui import app, ui
 
 from staff_portal.config import (
-    APP_NAME,
     NAV_ITEMS,
     PRIMARY,
     SECONDARY,
@@ -16,12 +15,19 @@ from staff_portal.config import (
 )
 
 
-# -------------------- SHARED WEBSITE LAYOUT --------------------
+# Website logo
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+ASSETS = PROJECT_DIR / 'assets'
+LOGO = ASSETS / 'logo.jpeg'
 
+if ASSETS.is_dir():
+    app.add_static_files('/assets', str(ASSETS))
+
+
+# Website layout
 def page_layout(page_title, active_path):
 
-    # -------------------- WEBSITE THEME --------------------
-
+    # Website colours
     ui.colors(
         primary=PRIMARY,
         secondary=SECONDARY,
@@ -40,9 +46,7 @@ def page_layout(page_title, active_path):
         </style>
     ''')
 
-
-    # -------------------- NAVIGATION SIDEBAR --------------------
-
+    # Navigation sidebar
     with ui.left_drawer(
         value=True,
         top_corner=False
@@ -54,15 +58,9 @@ def page_layout(page_title, active_path):
             'text-xs font-semibold text-slate-400 px-3 py-4'
         )
 
-
         for name, icon, path in NAV_ITEMS:
-
             is_active = path == active_path
-
-            if is_active:
-                background = PRIMARY
-            else:
-                background = 'transparent'
+            background = PRIMARY if is_active else 'transparent'
 
             ui.button(
                 name,
@@ -70,15 +68,11 @@ def page_layout(page_title, active_path):
                 on_click=lambda destination=path: ui.navigate.to(destination)
             ).props(
                 'flat no-caps align=left text-color=white'
-            ).classes(
-                'w-full mb-1'
-            ).style(
-                f'background-color: {background};'
-                'color: white !important;'
+            ).classes('w-full mb-1').style(
+                f'background-color: {background}; color: white !important;'
             )
 
-    # -------------------- TOP HEADER --------------------
-
+    # Top header
     with ui.header().classes(
         'items-center justify-between px-5 py-3'
     ).style(
@@ -92,33 +86,25 @@ def page_layout(page_title, active_path):
                 on_click=lambda: drawer.toggle()
             ).props('flat round dense')
 
-            ui.icon('local_shipping').classes(
-                'text-3xl'
-            ).style(f'color: {PRIMARY};')
-
-            with ui.column().classes('gap-0'):
-
-                ui.label(APP_NAME).classes(
-                    'text-xl font-bold'
-                ).style(f'color: {PRIMARY};')
-
-                ui.label('Staff Portal').classes(
-                    'text-xs text-slate-500'
+            if LOGO.is_file():
+                ui.image('/assets/logo.jpeg').classes(
+                    'h-16 w-auto'
+                ).props('fit=contain')
+            else:
+                ui.label('BluSend').classes(
+                    'text-xl font-bold text-blue-600'
                 )
 
         ui.label('Mailroom Operations').classes(
             'text-sm text-slate-500'
         )
 
-
-    # -------------------- MAIN CONTENT AREA --------------------
-
+    # Main content
     content = ui.column().classes(
         'w-full max-w-7xl mx-auto px-6 py-6 gap-5'
     )
 
     with content:
-
         ui.label(page_title).classes(
             'text-3xl font-bold text-slate-900'
         )
